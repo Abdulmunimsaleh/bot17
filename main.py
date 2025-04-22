@@ -6,8 +6,7 @@ import os
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
-# Configure Gemini API key
-genai.configure(api_key="AIzaSyAcQ64mgrvtNfTR3ebbHcZxzWfRkWHyI-E")  # Replace with your actual key
+genai.configure(api_key="AIzaSyAcQ64mgrvtNfTR3ebbHcZxzWfRkWHyI-E")
 
 app = FastAPI()
 
@@ -18,8 +17,6 @@ WEBSITE_PAGES = [
     "https://dev.tripzoori.com/",
     "https://dev.tripzoori.com/faq-tripzoori"
 ]
-
-conversation_state = {}
 
 def scrape_website(urls=WEBSITE_PAGES):
     combined_content = ""
@@ -33,7 +30,6 @@ def scrape_website(urls=WEBSITE_PAGES):
                 page.wait_for_selector("body")
                 combined_content += f"\nPage Content from {url}:\n{page.inner_text('body')}\n"
             browser.close()
-
         with open("website_data.json", "w", encoding="utf-8") as f:
             json.dump({"content": combined_content}, f, indent=4)
         return combined_content
@@ -97,19 +93,6 @@ def get_city_code(city_name: str) -> str:
         print(f"City code fetch failed for {city_name}: {e}")
         return ""
 
-def get_city_data(city_name: str):
-    try:
-        response = requests.get(CITY_LOOKUP_API + city_name)
-        response.raise_for_status()
-        cities = response.json()
-        if cities and isinstance(cities, list):
-            return cities[0]  # Includes 'countries' key
-        else:
-            return None
-    except Exception as e:
-        print(f"City data fetch failed for {city_name}: {e}")
-        return None
-
 def get_flight_info(origin_city: str, destination_city: str, departure_date: str):
     try:
         origin_code = get_city_code(origin_city)
@@ -150,7 +133,7 @@ def get_flight_info(origin_city: str, destination_city: str, departure_date: str
         return f"Error retrieving flight data: {str(e)}"
 
 def is_flight_query(question: str) -> bool:
-    keywords = ["flight", "book a flight", "find flight", "cheap flights", "airfare", "book a trip"]
+    keywords = ["flight", "book a flight", "find flight", "cheap flights", "airfare"]
     return any(k in question.lower() for k in keywords)
 
 def ask_question(question: str):
@@ -162,37 +145,6 @@ def ask_question(question: str):
     lang_instruction = f"Respond ONLY in {detected_language}." if detected_language != "en" else "Respond in English."
 
     import re
-
-    # Handle trip intent (part 1)
-    country_match = re.search(r"book (?:a )?(?:trip|flight) to ([a-zA-Z\s]+)", question.lower())
-    if country_match:
-        country = country_match.group(1).strip().title()
-        conversation_state["destination_country"] = country
-        return {
-            "message": f"Okay, where are you departing from and which date do you want to depart?",
-            "status": "awaiting_departure_info"
-        }
-
-    # Handle trip intent (part 2)
-    if "destination_country" in conversation_state:
-        match = re.search(r"from\s+([a-zA-Z\s]+)\s+(?:on|at)?\s*(\d{4}-\d{2}-\d{2})", question.lower())
-        if match:
-            departure_city = match.group(1).strip().title()
-            departure_date = match.group(2).strip()
-
-            # Fetch capital of the destination country
-            country = conversation_state.pop("destination_country")
-            city_data = get_city_data(country)
-            if city_data and "countries" in city_data:
-                capital_city = city_data["countries"]["capital"]
-                return {
-                    "question": f"Flight from {departure_city} to {capital_city} on {departure_date}",
-                    "answer": get_flight_info(departure_city, capital_city, departure_date)
-                }
-            else:
-                return {"message": f"Sorry, I couldn't determine the capital city of {country}."}
-
-    # Handle explicit structured flight query
     flight_pattern = re.search(r"from\s+([a-zA-Z\s]+)\s+to\s+([a-zA-Z\s]+)\s+on\s+(\d{4}-\d{2}-\d{2})", question.lower())
     if is_flight_query(question) and flight_pattern:
         origin = flight_pattern.group(1).strip()
@@ -200,7 +152,12 @@ def ask_question(question: str):
         date = flight_pattern.group(3).strip()
         return {"question": question, "answer": get_flight_info(origin, destination, date)}
 
-    # Fallback to website knowledge
+    intent_pattern = re.search(r"(book|booking|flight)\s+(to|for)\s+([a-zA-Z\s]+)", question.lower())
+    if intent_pattern:
+        return {
+            "message": "Great! I can help you with that. Could you please tell me:\n1. Which city are you departing from?\n2. Which city do you want to travel to?\n3. What is your departure date (format: YYYY-MM-DD)?"
+        }
+
     prompt = f"""
 You are a helpful AI assistant that answers questions based ONLY on the content of the website below.
 
