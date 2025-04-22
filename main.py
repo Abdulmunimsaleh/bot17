@@ -155,7 +155,7 @@ def ask_question(question: str):
     intent_pattern = re.search(r"(book|booking|flight)\s+(to|for)\s+([a-zA-Z\s]+)", question.lower())
     if intent_pattern:
         return {
-            "message": "Great! I can help you with that. Could you please tell me:\n1. Which city are you departing from?\n2. Which city do you want to travel to?\n3. What is your departure date (format: YYYY-MM-DD)?"
+            "response": "Great! I can help you with that. Could you please tell me:\n1. Which city are you departing from?\n2. Which city do you want to travel to?\n3. What is your departure date (format: YYYY-MM-DD)?"
         }
 
     prompt = f"""
