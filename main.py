@@ -5,6 +5,10 @@ import json
 import os
 import requests
 from concurrent.futures import ThreadPoolExecutor
+import re
+import datetime
+from dateutil import parser
+import calendar
 
 genai.configure(api_key="AIzaSyAcQ64mgrvtNfTR3ebbHcZxzWfRkWHyI-E")
 
@@ -99,7 +103,7 @@ def get_flight_info(origin_city: str, destination_city: str, departure_date: str
         destination_code = get_city_code(destination_city)
 
         if not origin_code or not destination_code:
-            return f"Sorry, I couldn’t find flight codes for one of the cities: {origin_city} or {destination_city}."
+            return f"Sorry, I couldn't find flight codes for one of the cities: {origin_city} or {destination_city}."
 
         url = f"https://tripzoori01-app.fly.dev/api/v1/flights/search?origin={origin_code}&destination={destination_code}&departure_date={departure_date}"
         response = requests.get(url)
@@ -132,9 +136,144 @@ def get_flight_info(origin_city: str, destination_city: str, departure_date: str
     except Exception as e:
         return f"Error retrieving flight data: {str(e)}"
 
+def parse_human_readable_date(date_str: str) -> str:
+    """Convert various date formats to YYYY-MM-DD"""
+    try:
+        # Current date for reference
+        today = datetime.datetime.now()
+        current_year = today.year
+        
+        # Handle relative dates
+        if re.search(r'\b(today|tonight)\b', date_str, re.IGNORECASE):
+            return today.strftime('%Y-%m-%d')
+        elif re.search(r'\b(tomorrow|tmrw|tmr)\b', date_str, re.IGNORECASE):
+            return (today + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+        elif re.search(r'\bnext week\b', date_str, re.IGNORECASE):
+            return (today + datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+        elif re.search(r'\bnext month\b', date_str, re.IGNORECASE):
+            if today.month == 12:
+                next_month = datetime.datetime(today.year + 1, 1, min(today.day, 31))
+            else:
+                next_month = datetime.datetime(today.year, today.month + 1, min(today.day, calendar.monthrange(today.year, today.month + 1)[1]))
+            return next_month.strftime('%Y-%m-%d')
+        
+        # Use regex to catch formats like "22nd of May" or "22nd May" without explicit year
+        day_month_pattern = re.search(r'(\d{1,2})(st|nd|rd|th)?\s+(?:of\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*', date_str.lower())
+        if day_month_pattern:
+            day = int(day_month_pattern.group(1))
+            month_str = day_month_pattern.group(3)
+            month_map = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 
+                         'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
+            month = month_map[month_str[:3].lower()]
+            
+            # If date is in the past for current year, use next year
+            date_with_year = datetime.datetime(current_year, month, day)
+            if date_with_year < today:
+                date_with_year = datetime.datetime(current_year + 1, month, day)
+                
+            return date_with_year.strftime('%Y-%m-%d')
+            
+        # Try dateutil parser as a backup
+        try:
+            parsed_date = parser.parse(date_str, fuzzy=True)
+            # Handle missing year by adding current year
+            if parsed_date.year == 1900:  # dateutil's default when year is missing
+                if parsed_date.replace(year=current_year) < today:
+                    parsed_date = parsed_date.replace(year=current_year + 1)
+                else:
+                    parsed_date = parsed_date.replace(year=current_year)
+            return parsed_date.strftime('%Y-%m-%d')
+        except:
+            pass
+            
+        return ""
+    except Exception as e:
+        print(f"Error parsing date '{date_str}': {e}")
+        return ""
+
+def extract_travel_info(question: str):
+    """
+    Extract origin, destination and date from natural language query
+    """
+    origin = None
+    destination = None
+    date_str = None
+    
+    # Clean up the query - replace specific words that might confuse the parsing
+    cleaned_question = question.lower()
+    cleaned_question = re.sub(r'\bheading\b', 'to', cleaned_question)
+    cleaned_question = re.sub(r'\btraveling\b', 'travel', cleaned_question)
+    
+    # Extract date first to avoid it being misidentified as a location
+    date_patterns = [
+        r'on\s+([a-zA-Z0-9\s,\.\/\-]+(?:of\s+[a-zA-Z]+)?(?:\s+\d{4})?)',
+        r'for\s+([a-zA-Z0-9\s,\.\/\-]+(?:of\s+[a-zA-Z]+)?(?:\s+\d{4})?)',
+        r'date[:]?\s+([a-zA-Z0-9\s,\.\/\-]+(?:of\s+[a-zA-Z]+)?(?:\s+\d{4})?)',
+        r'(\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?[a-zA-Z]+(?:\s+\d{4})?)',
+        r'([a-zA-Z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?)',
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, cleaned_question)
+        if match:
+            date_candidates = match.group(1).strip().rstrip('.,:;')
+            # Don't include question fragments in the date
+            if 'are there' not in date_candidates and 'is there' not in date_candidates:
+                date_str = date_candidates
+                # Remove the date part from the question to avoid confusion in city extraction
+                cleaned_question = cleaned_question.replace(match.group(0), ' ')
+                break
+    
+    # Common patterns for origin/destination
+    city_patterns = [
+        # from X to Y
+        r'from\s+([a-zA-Z\s]+?)\s+to\s+([a-zA-Z\s]+?)(?:\s+on|\s+for|\s+at|\s+in|\s+\?|$|\.)',
+        # departing X going to Y
+        r'(?:departing|leaving)\s+(?:from\s+)?([a-zA-Z\s]+?)\s+(?:to|going to|heading to|for)\s+([a-zA-Z\s]+?)(?:\s+on|\s+for|\s+at|\s+in|\s+\?|$|\.)',
+        # X to Y (where X is likely origin)
+        r'(?:^|\s)([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+to\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)(?:\s+on|\s+for|\s+at|\s+in|\s+\?|$|\.)',
+    ]
+    
+    for pattern in city_patterns:
+        match = re.search(pattern, cleaned_question)
+        if match:
+            origin = match.group(1).strip().rstrip('.,:;')
+            destination = match.group(2).strip().rstrip('.,:;')
+            break
+    
+    # If we still don't have cities, try looser individual city detection
+    if not origin or not destination:
+        from_pattern = r'(?:from|departing|departing from|leaving|leaving from)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)'
+        to_pattern = r'(?:to|going to|heading to|destination|arriving at|arrive at|arrival)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)'
+        
+        from_match = re.search(from_pattern, cleaned_question)
+        to_match = re.search(to_pattern, cleaned_question)
+        
+        if from_match:
+            origin = from_match.group(1).strip().rstrip('.,:;')
+        if to_match:
+            destination = to_match.group(1).strip().rstrip('.,:;')
+    
+    # Format the date if found
+    formatted_date = None
+    if date_str:
+        formatted_date = parse_human_readable_date(date_str)
+    
+    return {
+        "origin": origin,
+        "destination": destination,
+        "date": formatted_date,
+        "date_str": date_str
+    }
+
 def is_flight_query(question: str) -> bool:
-    keywords = ["flight", "book a flight", "find flight", "cheap flights", "airfare"]
+    keywords = ["flight", "book", "booking", "book a flight", "find flight", "cheap flights", "airfare", 
+                "travel", "trip", "tickets", "fly", "flying", "journey", "departure", "departing"]
     return any(k in question.lower() for k in keywords)
+
+def is_partial_booking_info(info):
+    """Check if we have partial booking information"""
+    return any([info["origin"], info["destination"], info["date_str"]]) and not all([info["origin"], info["destination"], info["date"]])
 
 def ask_question(question: str):
     data = load_data()
@@ -144,20 +283,73 @@ def ask_question(question: str):
         detected_language = "en"
     lang_instruction = f"Respond ONLY in {detected_language}." if detected_language != "en" else "Respond in English."
 
-    import re
-    flight_pattern = re.search(r"from\s+([a-zA-Z\s]+)\s+to\s+([a-zA-Z\s]+)\s+on\s+(\d{4}-\d{2}-\d{2})", question.lower())
-    if is_flight_query(question) and flight_pattern:
-        origin = flight_pattern.group(1).strip()
-        destination = flight_pattern.group(2).strip()
-        date = flight_pattern.group(3).strip()
-        return {"question": question, "answer": get_flight_info(origin, destination, date)}
+    # Debug info - print what was extracted
+    print(f"Processing question: {question}")
+    travel_info = extract_travel_info(question)
+    print(f"Extracted info: {travel_info}")
 
-    intent_pattern = re.search(r"(book|booking|flight)\s+(to|for)\s+([a-zA-Z\s]+)", question.lower())
-    if intent_pattern:
-        return {
-            "response": "Great! I can help you with that. Could you please tell me:\n1. Which city are you departing from?\n2. Which city do you want to travel to?\n3. What is your departure date (format: YYYY-MM-DD)?"
-        }
+    # Check if this is a flight query
+    if is_flight_query(question):
+        # Try to extract travel information        
+        # If we have complete information, proceed with the flight search
+        if travel_info["origin"] and travel_info["destination"] and travel_info["date"]:
+            return {"question": question, "answer": get_flight_info(travel_info["origin"], travel_info["destination"], travel_info["date"])}
+        
+        # If we have partial information, ask for the missing details
+        elif is_partial_booking_info(travel_info):
+            missing_info_prompt = "I'd be happy to help you find flights. "
+            
+            if not travel_info["origin"]:
+                missing_info_prompt += "Which city will you be departing from? "
+            
+            if not travel_info["destination"]:
+                missing_info_prompt += "Where would you like to go to? "
+            
+            if not travel_info["date"]:
+                if travel_info["date_str"]:
+                    missing_info_prompt += f"I couldn't understand the date '{travel_info['date_str']}'. Could you please provide the date in a format like 'May 22, 2025' or 'next Friday'? "
+                else:
+                    missing_info_prompt += "When would you like to travel? "
+            
+            # Include the information we already have for confirmation
+            if travel_info["origin"] or travel_info["destination"] or travel_info["date"]:
+                missing_info_prompt += "\n\nHere's what I understood so far: "
+                if travel_info["origin"]:
+                    missing_info_prompt += f"\n- Departing from: {travel_info['origin']}"
+                if travel_info["destination"]:
+                    missing_info_prompt += f"\n- Going to: {travel_info['destination']}"
+                if travel_info["date"]:
+                    missing_info_prompt += f"\n- Date: {travel_info['date']}"
+            
+            return {"response": missing_info_prompt}
+        
+        # Generic booking intent detected but no specific details
+        else:
+            return {
+                "response": "I'd be happy to help you find flights! Could you please provide the following details?\n\n1. Where will you be departing from?\n2. Where would you like to go?\n3. When do you plan to travel? (You can say things like 'May 22nd', 'next Friday', or '06/15/2025')"
+            }
 
+    # Handle conversation state - if they're responding to our questions about booking
+    state_keywords = {
+        "departure": ["from", "leaving", "departing", "departure city", "starting from"],
+        "destination": ["to", "going to", "destination", "arriving at", "want to visit"],
+        "date": ["on", "date", "when", "departing on", "leaving on", "travel on"]
+    }
+    
+    for state, keywords in state_keywords.items():
+        if any(k in question.lower() for k in keywords) and len(question.split()) < 5:
+            # This looks like an answer to our previous question
+            if state == "departure":
+                return {"response": f"Great! You're departing from {question.strip()}. Where would you like to go?"}
+            elif state == "destination":
+                return {"response": f"Perfect! When would you like to travel to {question.strip()}? (You can say dates like 'next Friday', '22nd May', etc.)"}
+            elif state == "date":
+                date = parse_human_readable_date(question)
+                if date:
+                    return {"response": f"Thanks! I've noted your travel date as {date}. To complete your flight search, could you please tell me your departure city and destination?"}
+                else:
+                    return {"response": "I'm having trouble understanding that date format. Could you please provide it in a format like 'May 22, 2025' or 'next Friday'?"}
+    
     prompt = f"""
 You are a helpful AI assistant that answers questions based ONLY on the content of the website below.
 
