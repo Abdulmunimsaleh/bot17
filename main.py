@@ -4,6 +4,7 @@ import google.generativeai as genai
 import re
 from datetime import datetime
 import requests
+import json
 
 app = FastAPI()
 
@@ -31,205 +32,239 @@ def format_short(text):
 def is_general_travel_request(message: str) -> bool:
     return any(kw in message.lower() for kw in initial_intent_keywords)
 
-# Month names for date extraction
-MONTH_NAMES = [
-    "january", "february", "march", "april", "may", "june", "july", 
-    "august", "september", "october", "november", "december",
-    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"
-]
-
-# Improved function to extract flight information from natural language
+# Enhanced intelligent function to extract travel information using AI
 def extract_flight_info(message: str):
+    print(f"Extracting flight info from: '{message}'")
+    
+    # First try using AI extraction to understand the full context
+    try:
+        extraction_prompt = f"""
+        Extract travel information from this text: "{message}"
+        
+        I need to know:
+        - Origin: The city/location the person is departing from
+        - Destination: The city/location the person is traveling to  
+        - Date: The travel date in YYYY-MM-DD format
+        
+        The text might contain phrases like "going to X", "from Y", "am from Z", etc.
+        Pay close attention to prepositions ("to", "from") to correctly identify origin vs destination.
+        
+        Format the response in JSON with the fields:
+        {{
+            "origin": "City name",
+            "destination": "City name",
+            "date": "YYYY-MM-DD"
+        }}
+        
+        If any information is missing, use null for that field.
+        """
+        
+        response = model.generate_content(extraction_prompt)
+        ai_response_text = response.text
+        
+        # Extract JSON content by finding text between { and }
+        json_match = re.search(r'\{.*\}', ai_response_text, re.DOTALL)
+        if json_match:
+            try:
+                ai_info = json.loads(json_match.group(0))
+                
+                origin = ai_info.get("origin")
+                destination = ai_info.get("destination")
+                date = ai_info.get("date")
+                
+                print(f"AI extracted: Origin={origin}, Destination={destination}, Date={date}")
+                
+                # Validate date if provided
+                if date:
+                    try:
+                        datetime.strptime(date, "%Y-%m-%d")
+                    except ValueError:
+                        # Try to parse the date if it's not in YYYY-MM-DD format
+                        try:
+                            # Handle common date formats that might come from the AI
+                            for fmt in ["%B %d, %Y", "%B %d %Y", "%d %B %Y", "%d-%m-%Y", "%m/%d/%Y"]:
+                                try:
+                                    parsed_date = datetime.strptime(date, fmt)
+                                    date = parsed_date.strftime("%Y-%m-%d")
+                                    break
+                                except ValueError:
+                                    continue
+                        except Exception:
+                            date = None
+                
+                # If we have all three pieces of information, return them
+                if origin and destination and date:
+                    return origin, destination, date
+                
+            except json.JSONDecodeError:
+                print("Failed to parse AI response as JSON")
+    except Exception as e:
+        print(f"AI extraction error: {e}")
+    
+    # Fall back to pattern matching if AI extraction fails
+    
+    # Preprocess the message - convert to lowercase
     message = message.lower()
     
-    # Dictionary to store extracted info
-    info = {
-        "origin": None,
-        "destination": None,
-        "date": None
-    }
+    # Create separate dictionaries to track potential matches with confidence scores
+    destinations = {}
+    origins = {}
+    dates = {}
     
-    # --- DESTINATION EXTRACTION ---
-    # Look for destination indicators
+    # --- DESTINATION PATTERNS ---
     dest_patterns = [
-        r"(?:to|for|destination|visit|visiting)\s+([a-z]+(?:\s+[a-z]+)?)",
-        r"(?:in|at)\s+([a-z]+(?:\s+[a-z]+)?)",
-        r"(?:go|going|travel|fly|flying)\s+(?:to|for|into)\s+([a-z]+(?:\s+[a-z]+)?)",
-        r"trip\s+to\s+([a-z]+(?:\s+[a-z]+)?)"
+        (r"(?:to|going to|go to|travel to|arrive (?:at|in)|heading to|destination)\s+([a-z]+(?:\s+[a-z]+)?)", 0.8),
+        (r"(?:visit|visiting|see|seeing)\s+([a-z]+(?:\s+[a-z]+)?)", 0.7),
+        (r"(?:want|planning)(?:\s+to)?\s+(?:go|visit|travel)(?:\s+to)?\s+([a-z]+(?:\s+[a-z]+)?)", 0.9)
     ]
     
-    for pattern in dest_patterns:
-        match = re.search(pattern, message)
-        if match:
-            possible_dest = match.group(1).strip()
-            # Skip common prepositions and articles that might be caught
-            if possible_dest not in ["to", "in", "at", "from", "on", "the", "a", "an"]:
-                info["destination"] = possible_dest.capitalize()
-                break
-    
-    # --- ORIGIN EXTRACTION ---
-    # Look for origin indicators
+    # --- ORIGIN PATTERNS ---
     origin_patterns = [
-        r"from\s+([a-z]+(?:\s+[a-z]+)?)",
-        r"(?:departing|leaving|departure)\s+(?:from)?\s+([a-z]+(?:\s+[a-z]+)?)",
-        r"start(?:ing)?\s+(?:from)?\s+([a-z]+(?:\s+[a-z]+)?)"
+        (r"(?:from|departing from|leaving from|coming from)\s+([a-z]+(?:\s+[a-z]+)?)", 0.8),
+        (r"(?:am|i am|i'm|we are|based in|located in|live in|staying in)\s+(?:from|in|at)?\s+([a-z]+(?:\s+[a-z]+)?)", 0.7),
+        (r"(?:start|starting|depart|departing|flying)(?:\s+from)?\s+([a-z]+(?:\s+[a-z]+)?)", 0.9)
     ]
     
-    for pattern in origin_patterns:
-        match = re.search(pattern, message)
-        if match:
-            possible_origin = match.group(1).strip()
-            # Skip common prepositions and articles
-            if possible_origin not in ["to", "in", "at", "from", "on", "the", "a", "an"]:
-                info["origin"] = possible_origin.capitalize()
-                break
+    # --- DATE PATTERNS ---
+    month_names = "january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+    date_patterns = [
+        (r"(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(" + month_names + r")", 0.8),  # "15th june", "15 of june"
+        (r"(" + month_names + r")\s+(\d{1,2})(?:st|nd|rd|th)?", 0.8),  # "june 15", "june 15th"
+        (r"on\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(" + month_names + r")", 0.9),  # "on the 15th of june"
+        (r"on\s+(?:the\s+)?(" + month_names + r")\s+(\d{1,2})(?:st|nd|rd|th)?", 0.9),  # "on june 15th"
+        (r"(\d{4}-\d{2}-\d{2})", 0.95),  # "2025-06-15"
+        (r"(\d{1,2})[\/\.-](\d{1,2})[\/\.-](\d{2,4})", 0.8)  # "15/06/2025", "15.06.25", "15-06-2025"
+    ]
     
-    # --- DATE EXTRACTION ---
-    # Look for various date formats
+    # Process destination patterns
+    for pattern, confidence in dest_patterns:
+        matches = re.finditer(pattern, message)
+        for match in matches:
+            potential_dest = match.group(1).strip()
+            if len(potential_dest) > 2 and potential_dest not in ["to", "the", "a", "an", "from", "on", "in", "at"]:
+                destinations[potential_dest] = max(confidence, destinations.get(potential_dest, 0))
     
-    # Format: YYYY-MM-DD
-    date_pattern1 = r"(\d{4}-\d{1,2}-\d{1,2})"
-    match = re.search(date_pattern1, message)
-    if match:
-        info["date"] = match.group(1)
+    # Process origin patterns
+    for pattern, confidence in origin_patterns:
+        matches = re.finditer(pattern, message)
+        for match in matches:
+            potential_origin = match.group(1).strip()
+            if len(potential_origin) > 2 and potential_origin not in ["to", "the", "a", "an", "from", "on", "in", "at"]:
+                origins[potential_origin] = max(confidence, origins.get(potential_origin, 0))
     
-    # Format: Month Day (e.g., "June 15", "Jun 15", "June 15th")
-    month_pattern = "|".join(MONTH_NAMES)
-    date_pattern2 = rf"({month_pattern})\s+(\d{{1,2}}(?:st|nd|rd|th)?)"
-    match = re.search(date_pattern2, message)
-    if match and not info["date"]:
-        month = match.group(1).lower()
-        day = re.sub(r'(st|nd|rd|th)', '', match.group(2))
-        
-        # Convert month abbreviation to full name if needed
-        month_mapping = {
-            "jan": "january", "feb": "february", "mar": "march", "apr": "april",
-            "may": "may", "jun": "june", "jul": "july", "aug": "august",
-            "sep": "september", "oct": "october", "nov": "november", "dec": "december"
-        }
-        
-        full_month = month_mapping.get(month, month)
-        
-        # Use current year
-        current_year = datetime.now().year
-        date_str = f"{full_month} {day} {current_year}"
-        
-        try:
-            parsed_date = datetime.strptime(date_str, "%B %d %Y")
-            info["date"] = parsed_date.strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-    
-    # Format: Day Month (e.g., "15 June", "15th June")
-    date_pattern3 = rf"(\d{{1,2}}(?:st|nd|rd|th)?)\s+({month_pattern})"
-    match = re.search(date_pattern3, message)
-    if match and not info["date"]:
-        day = re.sub(r'(st|nd|rd|th)', '', match.group(1))
-        month = match.group(2).lower()
-        
-        # Convert month abbreviation to full name if needed
-        month_mapping = {
-            "jan": "january", "feb": "february", "mar": "march", "apr": "april",
-            "may": "may", "jun": "june", "jul": "july", "aug": "august",
-            "sep": "september", "oct": "october", "nov": "november", "dec": "december"
-        }
-        
-        full_month = month_mapping.get(month, month)
-        
-        # Use current year
-        current_year = datetime.now().year
-        date_str = f"{full_month} {day} {current_year}"
-        
-        try:
-            parsed_date = datetime.strptime(date_str, "%B %d %Y")
-            info["date"] = parsed_date.strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-    
-    # Format: MM/DD/YYYY or DD/MM/YYYY
-    date_pattern4 = r"(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})"
-    match = re.search(date_pattern4, message)
-    if match and not info["date"]:
-        # Ambiguous - try both MM/DD and DD/MM format
-        formats = [
-            # MM/DD/YYYY
-            {
-                "month": match.group(1),
-                "day": match.group(2),
-                "year": match.group(3)
-            },
-            # DD/MM/YYYY
-            {
-                "month": match.group(2),
-                "day": match.group(1),
-                "year": match.group(3)
-            }
-        ]
-        
-        for format_dict in formats:
-            try:
-                # Handle 2-digit years
-                year = format_dict["year"]
-                if len(year) == 2:
-                    # Assume 20XX for years less than 50, 19XX otherwise
-                    year = f"20{year}" if int(year) < 50 else f"19{year}"
+    # Process date patterns
+    for pattern, confidence in date_patterns:
+        matches = re.finditer(pattern, message)
+        for match in matches:
+            if len(match.groups()) == 1:  # ISO format date
+                dates[match.group(1)] = confidence
+            elif "jan" in pattern or "february" in pattern:  # Month-Day or Day-Month patterns
+                # Check if month is first or second in the pattern
+                if re.search(r"\(" + month_names + r"\)", pattern.split(r"\s+")[0]):
+                    # Month is first (e.g., "june 15")
+                    month = match.group(1)
+                    day = match.group(2)
+                else:
+                    # Day is first (e.g., "15 june")
+                    day = match.group(1)
+                    month = match.group(2)
                 
-                date_str = f"{year}-{int(format_dict['month']):02d}-{int(format_dict['day']):02d}"
-                parsed_date = datetime.strptime(date_str, "%Y-%m-%d")
-                info["date"] = date_str
-                break
-            except ValueError:
-                continue
-    
-    # Check if all required info is present
-    if info["origin"] and info["destination"] and info["date"]:
-        return info["origin"], info["destination"], info["date"]
-    else:
-        # Use Gemini AI to extract flight info for complex sentences
-        if not (info["origin"] and info["destination"] and info["date"]):
-            try:
-                # Use Gemini to extract missing information
-                extraction_prompt = f"""
-                Extract travel information from this text: "{message}"
+                # Normalize month name
+                month_mapping = {
+                    "jan": "january", "feb": "february", "mar": "march", "apr": "april",
+                    "may": "may", "jun": "june", "jul": "july", "aug": "august", 
+                    "sep": "september", "oct": "october", "nov": "november", "dec": "december"
+                }
+                full_month = month_mapping.get(month, month)
                 
-                Format the response as JSON with these fields:
-                - origin: The city/location the person is departing from
-                - destination: The city/location the person is traveling to  
-                - date: The travel date in YYYY-MM-DD format
-                
-                For any missing information, use null.
-                """
-                
-                response = model.generate_content(extraction_prompt)
-                
-                # Try to parse the AI response
-                ai_response_text = response.text
-                
-                # Extract JSON content by finding text between { and }
-                json_match = re.search(r'\{.*\}', ai_response_text, re.DOTALL)
-                if json_match:
-                    import json
-                    try:
-                        ai_info = json.loads(json_match.group(0))
+                # Parse the date
+                try:
+                    day = int(re.sub(r'(?:st|nd|rd|th)', '', day))
+                    current_year = datetime.now().year
+                    date_obj = datetime.strptime(f"{full_month} {day} {current_year}", "%B %d %Y")
+                    formatted_date = date_obj.strftime("%Y-%m-%d")
+                    dates[formatted_date] = confidence
+                except (ValueError, TypeError):
+                    pass
+            else:  # MM/DD/YYYY or DD/MM/YYYY
+                try:
+                    # Try both formats
+                    day = None
+                    month = None
+                    year = None
+                    
+                    if match.lastindex == 3:  # We have 3 parts
+                        first, second, third = match.groups()
                         
-                        # Use AI-extracted info to fill in gaps
-                        if not info["origin"] and ai_info.get("origin"):
-                            info["origin"] = ai_info["origin"].capitalize()
+                        # Determine which is which
+                        if len(third) == 4:  # Full year
+                            year = third
+                            if int(first) <= 12:  # First is likely month
+                                month, day = first, second
+                            else:  # First is likely day
+                                day, month = first, second
+                        elif len(third) == 2:  # Shortened year
+                            year = f"20{third}" if int(third) < 50 else f"19{third}"
+                            if int(first) <= 12:  # First is likely month
+                                month, day = first, second
+                            else:  # First is likely day
+                                day, month = first, second
                         
-                        if not info["destination"] and ai_info.get("destination"):
-                            info["destination"] = ai_info["destination"].capitalize()
-                        
-                        if not info["date"] and ai_info.get("date"):
-                            info["date"] = ai_info["date"]
-                    except json.JSONDecodeError:
-                        print("Failed to parse AI response as JSON")
-            except Exception as e:
-                print(f"AI extraction error: {e}")
+                        if day and month and year:
+                            try:
+                                date_obj = datetime.strptime(f"{year}-{int(month):02d}-{int(day):02d}", "%Y-%m-%d")
+                                formatted_date = date_obj.strftime("%Y-%m-%d")
+                                dates[formatted_date] = confidence
+                            except (ValueError, TypeError):
+                                # Try the other way around
+                                try:
+                                    date_obj = datetime.strptime(f"{year}-{int(day):02d}-{int(month):02d}", "%Y-%m-%d")
+                                    formatted_date = date_obj.strftime("%Y-%m-%d")
+                                    dates[formatted_date] = confidence
+                                except (ValueError, TypeError):
+                                    pass
+                except (ValueError, TypeError):
+                    pass
     
-    # Final check if we have all required info
-    if info["origin"] and info["destination"] and info["date"]:
-        return info["origin"], info["destination"], info["date"]
+    # Find the most likely candidates based on confidence
+    best_destination = max(destinations.items(), key=lambda x: x[1])[0] if destinations else None
+    best_origin = max(origins.items(), key=lambda x: x[1])[0] if origins else None
+    best_date = max(dates.items(), key=lambda x: x[1])[0] if dates else None
     
+    print(f"Pattern extraction: Origin={best_origin}, Destination={best_destination}, Date={best_date}")
+    
+    # Special case: If origin and destination have the same value
+    if best_origin and best_destination and best_origin == best_destination:
+        # Try to determine which is which based on context
+        if "from " + best_origin in message and "to " + best_destination not in message:
+            # The word appears after "from" but not after "to", so it's likely the origin
+            best_destination = None
+        elif "to " + best_destination in message and "from " + best_origin not in message:
+            # The word appears after "to" but not after "from", so it's likely the destination
+            best_origin = None
+        else:
+            # Can't determine, prioritize destination and clear origin to avoid confusion
+            best_origin = None
+    
+    # Handle special phrase "am from X"
+    if not best_origin:
+        am_from_match = re.search(r"(?:i'm|i am|am)\s+from\s+([a-z]+(?:\s+[a-z]+)?)", message)
+        if am_from_match:
+            potential_origin = am_from_match.group(1).strip()
+            if potential_origin not in ["to", "the", "a", "an", "from", "on", "in", "at"]:
+                best_origin = potential_origin
+    
+    # Capitalize names
+    if best_origin:
+        best_origin = best_origin.capitalize()
+    if best_destination:
+        best_destination = best_destination.capitalize()
+    
+    # Check if we have all necessary information
+    if best_origin and best_destination and best_date:
+        return best_origin, best_destination, best_date
+    
+    # If we still don't have all the information, return None
     return None, None, None
 
 # Function to get city code from city name using the cities API
@@ -258,11 +293,11 @@ async def chat_endpoint(message: str = ""):
     try:
         print(f"Processing message: '{message}'")
         
-        # Extract flight details with the more intelligent extraction function
+        # Extract flight details with the super intelligent extraction function
         origin, destination, departure_date = extract_flight_info(message)
         
         if origin and destination and departure_date:
-            print(f"Extracted: Origin={origin}, Destination={destination}, Date={departure_date}")
+            print(f"Final extraction: Origin={origin}, Destination={destination}, Date={departure_date}")
             
             # Get airport codes for the cities
             origin_code = get_city_code(origin)
@@ -336,20 +371,20 @@ async def chat_endpoint(message: str = ""):
                         return {"response": f"Flight found from {origin} to {destination}, but no segment details available."}
                 else:
                     # No flights found with the user's parameters
-                    return {"response": f"No flights found from {origin} ({origin_code}) to {destination} ({destination_code}) on {departure_date}."}
+                    return {"response": f"No flights found from {origin} to {destination} on {departure_date}."}
             else:
                 error_message = flight_response.text if hasattr(flight_response, 'text') else "Unknown error"
-                return {"response": f"Sorry, I couldn't find flight information. The flight search API returned status: {flight_response.status_code}. Error: {error_message}"}
+                return {"response": f"Sorry, I couldn't find flight information. Please try again with different dates or locations."}
 
         # If flight details aren't found, process general travel intent
         if is_general_travel_request(message):
             return {
                 "response": (
-                    "Great! Let's plan your trip. I need a few details first:\n"
-                    "1. Where do you want to go?\n"
-                    "2. Where are you departing from?\n"
-                    "3. What date do you want to travel?\n"
-                    "You can provide these details in any way that's comfortable for you."
+                    "I'd be happy to help you plan your trip! To search for flights, please tell me:\n"
+                    "- Where you're traveling from\n"
+                    "- Where you want to go\n"
+                    "- When you want to travel\n\n"
+                    "For example, you could say something like \"I want to fly from Nairobi to Mombasa on June 15th\" or \"Looking for a trip to Mombasa from Nairobi next month.\""
                 )
             }
 
