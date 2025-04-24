@@ -13,7 +13,8 @@ model = genai.GenerativeModel("gemini-1.5-pro")
 
 # Keywords that suggest the user hasn't provided enough travel info yet
 initial_intent_keywords = [
-    "i want to go", "i want a trip", "plan a trip", "i want to travel", "book a flight", "trip please", "vacation", "holiday"
+    "i want to go", "i want a trip", "plan a trip", "i want to travel", "book a flight", 
+    "trip please", "vacation", "holiday", "travel", "flight", "journey"
 ]
 
 # Format key details only
@@ -30,62 +31,205 @@ def format_short(text):
 def is_general_travel_request(message: str) -> bool:
     return any(kw in message.lower() for kw in initial_intent_keywords)
 
-# Function to extract flight details with flexible date formats
+# Month names for date extraction
+MONTH_NAMES = [
+    "january", "february", "march", "april", "may", "june", "july", 
+    "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"
+]
+
+# Improved function to extract flight information from natural language
 def extract_flight_info(message: str):
-    # More flexible patterns to match different sentence structures
-    patterns = [
-        # Original pattern: "from X to Y on Z"
-        r"\bfrom (\w+)\s+to (\w+)\s+on\s+([A-Za-z]+(?: \d{1,2})?|\d{4}-\d{2}-\d{2})\b",
-        
-        # New pattern: "to Y from X on Z"
-        r"\bto (\w+)\s+from (\w+)\s+on\s+([A-Za-z]+(?: \d{1,2})?|\d{4}-\d{2}-\d{2})\b",
-        
-        # Additional pattern: "I want to go to Y from X on Z"
-        r"want to go to (\w+)\s+from (\w+)\s+on\s+([A-Za-z]+(?: \d{1,2})?|\d{4}-\d{2}-\d{2})\b",
-        
-        # Additional pattern for more variations
-        r"(?:travel|fly|trip)(?:\s+to)?\s+(\w+)\s+from\s+(\w+)\s+on\s+([A-Za-z]+(?: \d{1,2})?|\d{4}-\d{2}-\d{2})\b"
+    message = message.lower()
+    
+    # Dictionary to store extracted info
+    info = {
+        "origin": None,
+        "destination": None,
+        "date": None
+    }
+    
+    # --- DESTINATION EXTRACTION ---
+    # Look for destination indicators
+    dest_patterns = [
+        r"(?:to|for|destination|visit|visiting)\s+([a-z]+(?:\s+[a-z]+)?)",
+        r"(?:in|at)\s+([a-z]+(?:\s+[a-z]+)?)",
+        r"(?:go|going|travel|fly|flying)\s+(?:to|for|into)\s+([a-z]+(?:\s+[a-z]+)?)",
+        r"trip\s+to\s+([a-z]+(?:\s+[a-z]+)?)"
     ]
     
-    for pattern in patterns:
-        match = re.search(pattern, message.lower())
+    for pattern in dest_patterns:
+        match = re.search(pattern, message)
         if match:
-            # For patterns where destination comes first (to Y from X)
-            if "to" in pattern.split("from")[0]:
-                destination = match.group(1).capitalize()
-                origin = match.group(2).capitalize()
-            # For patterns where origin comes first (from X to Y)
-            else:
-                origin = match.group(1).capitalize()
-                destination = match.group(2).capitalize()
-                
-            departure_date = match.group(3)
-
-            # Convert textual dates like 'June 15' to a standard format like '2025-06-15'
+            possible_dest = match.group(1).strip()
+            # Skip common prepositions and articles that might be caught
+            if possible_dest not in ["to", "in", "at", "from", "on", "the", "a", "an"]:
+                info["destination"] = possible_dest.capitalize()
+                break
+    
+    # --- ORIGIN EXTRACTION ---
+    # Look for origin indicators
+    origin_patterns = [
+        r"from\s+([a-z]+(?:\s+[a-z]+)?)",
+        r"(?:departing|leaving|departure)\s+(?:from)?\s+([a-z]+(?:\s+[a-z]+)?)",
+        r"start(?:ing)?\s+(?:from)?\s+([a-z]+(?:\s+[a-z]+)?)"
+    ]
+    
+    for pattern in origin_patterns:
+        match = re.search(pattern, message)
+        if match:
+            possible_origin = match.group(1).strip()
+            # Skip common prepositions and articles
+            if possible_origin not in ["to", "in", "at", "from", "on", "the", "a", "an"]:
+                info["origin"] = possible_origin.capitalize()
+                break
+    
+    # --- DATE EXTRACTION ---
+    # Look for various date formats
+    
+    # Format: YYYY-MM-DD
+    date_pattern1 = r"(\d{4}-\d{1,2}-\d{1,2})"
+    match = re.search(date_pattern1, message)
+    if match:
+        info["date"] = match.group(1)
+    
+    # Format: Month Day (e.g., "June 15", "Jun 15", "June 15th")
+    month_pattern = "|".join(MONTH_NAMES)
+    date_pattern2 = rf"({month_pattern})\s+(\d{{1,2}}(?:st|nd|rd|th)?)"
+    match = re.search(date_pattern2, message)
+    if match and not info["date"]:
+        month = match.group(1).lower()
+        day = re.sub(r'(st|nd|rd|th)', '', match.group(2))
+        
+        # Convert month abbreviation to full name if needed
+        month_mapping = {
+            "jan": "january", "feb": "february", "mar": "march", "apr": "april",
+            "may": "may", "jun": "june", "jul": "july", "aug": "august",
+            "sep": "september", "oct": "october", "nov": "november", "dec": "december"
+        }
+        
+        full_month = month_mapping.get(month, month)
+        
+        # Use current year
+        current_year = datetime.now().year
+        date_str = f"{full_month} {day} {current_year}"
+        
+        try:
+            parsed_date = datetime.strptime(date_str, "%B %d %Y")
+            info["date"] = parsed_date.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    
+    # Format: Day Month (e.g., "15 June", "15th June")
+    date_pattern3 = rf"(\d{{1,2}}(?:st|nd|rd|th)?)\s+({month_pattern})"
+    match = re.search(date_pattern3, message)
+    if match and not info["date"]:
+        day = re.sub(r'(st|nd|rd|th)', '', match.group(1))
+        month = match.group(2).lower()
+        
+        # Convert month abbreviation to full name if needed
+        month_mapping = {
+            "jan": "january", "feb": "february", "mar": "march", "apr": "april",
+            "may": "may", "jun": "june", "jul": "july", "aug": "august",
+            "sep": "september", "oct": "october", "nov": "november", "dec": "december"
+        }
+        
+        full_month = month_mapping.get(month, month)
+        
+        # Use current year
+        current_year = datetime.now().year
+        date_str = f"{full_month} {day} {current_year}"
+        
+        try:
+            parsed_date = datetime.strptime(date_str, "%B %d %Y")
+            info["date"] = parsed_date.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    
+    # Format: MM/DD/YYYY or DD/MM/YYYY
+    date_pattern4 = r"(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})"
+    match = re.search(date_pattern4, message)
+    if match and not info["date"]:
+        # Ambiguous - try both MM/DD and DD/MM format
+        formats = [
+            # MM/DD/YYYY
+            {
+                "month": match.group(1),
+                "day": match.group(2),
+                "year": match.group(3)
+            },
+            # DD/MM/YYYY
+            {
+                "month": match.group(2),
+                "day": match.group(1),
+                "year": match.group(3)
+            }
+        ]
+        
+        for format_dict in formats:
             try:
-                if re.match(r'\d{4}-\d{2}-\d{2}', departure_date):  # If date is in YYYY-MM-DD format
-                    departure_date = datetime.strptime(departure_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-                else:  # If date is in Month Day format (e.g., June 15)
-                    # Use CURRENT year (not next year) for date
-                    current_year = datetime.now().year
-                    date_with_year = f"{departure_date} {current_year}"
-                    
-                    # Try different date formats
-                    for date_format in ["%B %d %Y", "%b %d %Y"]:
-                        try:
-                            parsed_date = datetime.strptime(date_with_year, date_format)
-                            departure_date = parsed_date.strftime("%Y-%m-%d")
-                            print(f"Successfully parsed date to: {departure_date}")
-                            break
-                        except ValueError:
-                            continue
+                # Handle 2-digit years
+                year = format_dict["year"]
+                if len(year) == 2:
+                    # Assume 20XX for years less than 50, 19XX otherwise
+                    year = f"20{year}" if int(year) < 50 else f"19{year}"
+                
+                date_str = f"{year}-{int(format_dict['month']):02d}-{int(format_dict['day']):02d}"
+                parsed_date = datetime.strptime(date_str, "%Y-%m-%d")
+                info["date"] = date_str
+                break
+            except ValueError:
+                continue
+    
+    # Check if all required info is present
+    if info["origin"] and info["destination"] and info["date"]:
+        return info["origin"], info["destination"], info["date"]
+    else:
+        # Use Gemini AI to extract flight info for complex sentences
+        if not (info["origin"] and info["destination"] and info["date"]):
+            try:
+                # Use Gemini to extract missing information
+                extraction_prompt = f"""
+                Extract travel information from this text: "{message}"
+                
+                Format the response as JSON with these fields:
+                - origin: The city/location the person is departing from
+                - destination: The city/location the person is traveling to  
+                - date: The travel date in YYYY-MM-DD format
+                
+                For any missing information, use null.
+                """
+                
+                response = model.generate_content(extraction_prompt)
+                
+                # Try to parse the AI response
+                ai_response_text = response.text
+                
+                # Extract JSON content by finding text between { and }
+                json_match = re.search(r'\{.*\}', ai_response_text, re.DOTALL)
+                if json_match:
+                    import json
+                    try:
+                        ai_info = json.loads(json_match.group(0))
+                        
+                        # Use AI-extracted info to fill in gaps
+                        if not info["origin"] and ai_info.get("origin"):
+                            info["origin"] = ai_info["origin"].capitalize()
+                        
+                        if not info["destination"] and ai_info.get("destination"):
+                            info["destination"] = ai_info["destination"].capitalize()
+                        
+                        if not info["date"] and ai_info.get("date"):
+                            info["date"] = ai_info["date"]
+                    except json.JSONDecodeError:
+                        print("Failed to parse AI response as JSON")
             except Exception as e:
-                print(f"Date parsing error: {e}")
-                return None, None, None  # Return None if date parsing fails
-
-            return origin, destination, departure_date
-
-    # If no matches were found with any pattern
+                print(f"AI extraction error: {e}")
+    
+    # Final check if we have all required info
+    if info["origin"] and info["destination"] and info["date"]:
+        return info["origin"], info["destination"], info["date"]
+    
     return None, None, None
 
 # Function to get city code from city name using the cities API
@@ -114,7 +258,7 @@ async def chat_endpoint(message: str = ""):
     try:
         print(f"Processing message: '{message}'")
         
-        # Extract flight details first
+        # Extract flight details with the more intelligent extraction function
         origin, destination, departure_date = extract_flight_info(message)
         
         if origin and destination and departure_date:
@@ -205,7 +349,7 @@ async def chat_endpoint(message: str = ""):
                     "1. Where do you want to go?\n"
                     "2. Where are you departing from?\n"
                     "3. What date do you want to travel?\n"
-                    "You can answer all at once, like: 'I want to go to Paris from Nairobi on June 15'."
+                    "You can provide these details in any way that's comfortable for you."
                 )
             }
 
