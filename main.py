@@ -1,389 +1,225 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 import google.generativeai as genai
-from langdetect import detect
-import json
-import os
-import requests
-from concurrent.futures import ThreadPoolExecutor
 import re
-import datetime
-from dateutil import parser
-import calendar
-
-genai.configure(api_key="AIzaSyAcQ64mgrvtNfTR3ebbHcZxzWfRkWHyI-E")
+from datetime import datetime
+import requests
 
 app = FastAPI()
 
-TIDIO_CHAT_URL = "https://www.tidio.com/panel/inbox/conversations/unassigned/"
-CITY_LOOKUP_API = "https://tripzoori01-app.fly.dev/api/v1/base/cities/search?query="
+# Gemini config
+genai.configure(api_key="AIzaSyAcQ64mgrvtNfTR3ebbHcZxzWfRkWHyI-E")
+model = genai.GenerativeModel("gemini-1.5-pro")
 
-WEBSITE_PAGES = [
-    "https://dev.tripzoori.com/",
-    "https://dev.tripzoori.com/faq-tripzoori"
+# Keywords that suggest the user hasn't provided enough travel info yet
+initial_intent_keywords = [
+    "i want to go", "i want a trip", "plan a trip", "i want to travel", "book a flight", "trip please", "vacation", "holiday"
 ]
 
-def scrape_website(urls=WEBSITE_PAGES):
-    combined_content = ""
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            for url in urls:
-                page = browser.new_page()
-                page.goto(url)
-                page.wait_for_selector("body")
-                combined_content += f"\nPage Content from {url}:\n{page.inner_text('body')}\n"
-            browser.close()
-        with open("website_data.json", "w", encoding="utf-8") as f:
-            json.dump({"content": combined_content}, f, indent=4)
-        return combined_content
-    except Exception as e:
-        print(f"Error during scraping: {e}")
-        return ""
+# Format key details only
+def format_short(text):
+    lines = text.strip().split('\n')
+    filtered = []
+    keywords = ["Destination", "Trip Type", "Duration", "Highlights", "Key Activities", "-"]
+    for line in lines:
+        if any(k.lower() in line.lower() for k in keywords):
+            filtered.append(line.strip())
+    return "\n".join(filtered[:15])  # limit to first 15 matching lines
 
-def load_data():
-    try:
-        if os.path.exists("website_data.json"):
-            with open("website_data.json", "r", encoding="utf-8") as f:
-                file_content = f.read().strip()
-                if not file_content:
-                    return ""
-                try:
-                    data = json.loads(file_content)
-                    return data.get("content", "")
-                except json.JSONDecodeError:
-                    return ""
-        else:
-            return scrape_website()
-    except Exception as e:
-        print(f"Error in load_data: {e}")
-        return ""
+# Simple intent detection
+def is_general_travel_request(message: str) -> bool:
+    return any(kw in message.lower() for kw in initial_intent_keywords)
 
-def send_message_to_tidio(message: str):
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(TIDIO_CHAT_URL)
-            page.wait_for_selector("textarea", timeout=10000)
-            page.fill("textarea", message)
-            page.keyboard.press("Enter")
-            browser.close()
-    except Exception as e:
-        print(f"Error sending to Tidio: {e}")
-        return False
-    return True
-
-def needs_human_agent(question: str, answer: str) -> bool:
-    triggers = [
-        "I can't", "I do not", "I am unable", "I don't have information",
-        "I cannot", "I am just an AI", "I don't know", "I only provide information",
-        "I'm not sure", "I apologize", "Unfortunately, I cannot"
-    ]
-    keywords = ["complaints", "refunds", "booking issue", "flight problem", "support", "human agent", "live agent"]
-    return any(t in answer.lower() for t in triggers) or any(k in question.lower() for k in keywords)
-
-def get_city_code(city_name: str) -> str:
-    try:
-        response = requests.get(CITY_LOOKUP_API + city_name)
-        response.raise_for_status()
-        cities = response.json()
-        if cities and isinstance(cities, list):
-            return cities[0]["code"]
-        else:
-            return ""
-    except Exception as e:
-        print(f"City code fetch failed for {city_name}: {e}")
-        return ""
-
-def get_flight_info(origin_city: str, destination_city: str, departure_date: str):
-    try:
-        origin_code = get_city_code(origin_city)
-        destination_code = get_city_code(destination_city)
-
-        if not origin_code or not destination_code:
-            return f"Sorry, I couldn't find flight codes for one of the cities: {origin_city} or {destination_city}."
-
-        url = f"https://tripzoori01-app.fly.dev/api/v1/flights/search?origin={origin_code}&destination={destination_code}&departure_date={departure_date}"
-        response = requests.get(url)
-        response.raise_for_status()
-        flights = response.json().get("itineraries", [])
-
-        if not flights:
-            return "No flights were found for the specified route and date."
-
-        sorted_flights = sorted(flights, key=lambda x: x["price"]["totalFare"])[:2]
-        results = []
-        for flight in sorted_flights:
-            segments = flight["segments"]
-            price = flight["price"]["totalFare"]
-            currency = flight["price"]["currency"]
-
-            journey_description = []
-            for idx, seg in enumerate(segments):
-                journey_description.append(
-                    f"Segment {idx+1}:\n"
-                    f"✈️ {seg['airlineName']} Flight {seg['flightNumber']} from "
-                    f"{seg['departureCity']} ({seg['departureAirportCode']}) to {seg['arrivalCity']} ({seg['arrivalAirportCode']})\n"
-                    f"🕑 Departure: {seg['departureTime']} → Arrival: {seg['arrivalTime']}\n"
-                    f"💺 Class: {seg['cabinClass']}\n"
-                )
-            journey_str = "\n".join(journey_description)
-            results.append(f"{journey_str}\n💵 Total Price: {price} {currency}\n{'='*50}")
-
-        return "\n\n".join(results)
-    except Exception as e:
-        return f"Error retrieving flight data: {str(e)}"
-
-def parse_human_readable_date(date_str: str) -> str:
-    """Convert various date formats to YYYY-MM-DD"""
-    try:
-        # Current date for reference
-        today = datetime.datetime.now()
-        current_year = today.year
+# Function to extract flight details with flexible date formats
+def extract_flight_info(message: str):
+    # More flexible patterns to match different sentence structures
+    patterns = [
+        # Original pattern: "from X to Y on Z"
+        r"\bfrom (\w+)\s+to (\w+)\s+on\s+([A-Za-z]+(?: \d{1,2})?|\d{4}-\d{2}-\d{2})\b",
         
-        # Handle relative dates
-        if re.search(r'\b(today|tonight)\b', date_str, re.IGNORECASE):
-            return today.strftime('%Y-%m-%d')
-        elif re.search(r'\b(tomorrow|tmrw|tmr)\b', date_str, re.IGNORECASE):
-            return (today + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
-        elif re.search(r'\bnext week\b', date_str, re.IGNORECASE):
-            return (today + datetime.timedelta(days=7)).strftime('%Y-%m-%d')
-        elif re.search(r'\bnext month\b', date_str, re.IGNORECASE):
-            if today.month == 12:
-                next_month = datetime.datetime(today.year + 1, 1, min(today.day, 31))
+        # New pattern: "to Y from X on Z"
+        r"\bto (\w+)\s+from (\w+)\s+on\s+([A-Za-z]+(?: \d{1,2})?|\d{4}-\d{2}-\d{2})\b",
+        
+        # Additional pattern: "I want to go to Y from X on Z"
+        r"want to go to (\w+)\s+from (\w+)\s+on\s+([A-Za-z]+(?: \d{1,2})?|\d{4}-\d{2}-\d{2})\b",
+        
+        # Additional pattern for more variations
+        r"(?:travel|fly|trip)(?:\s+to)?\s+(\w+)\s+from\s+(\w+)\s+on\s+([A-Za-z]+(?: \d{1,2})?|\d{4}-\d{2}-\d{2})\b"
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, message.lower())
+        if match:
+            # For patterns where destination comes first (to Y from X)
+            if "to" in pattern.split("from")[0]:
+                destination = match.group(1).capitalize()
+                origin = match.group(2).capitalize()
+            # For patterns where origin comes first (from X to Y)
             else:
-                next_month = datetime.datetime(today.year, today.month + 1, min(today.day, calendar.monthrange(today.year, today.month + 1)[1]))
-            return next_month.strftime('%Y-%m-%d')
-        
-        # Use regex to catch formats like "22nd of May" or "22nd May" without explicit year
-        day_month_pattern = re.search(r'(\d{1,2})(st|nd|rd|th)?\s+(?:of\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*', date_str.lower())
-        if day_month_pattern:
-            day = int(day_month_pattern.group(1))
-            month_str = day_month_pattern.group(3)
-            month_map = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 
-                         'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
-            month = month_map[month_str[:3].lower()]
-            
-            # If date is in the past for current year, use next year
-            date_with_year = datetime.datetime(current_year, month, day)
-            if date_with_year < today:
-                date_with_year = datetime.datetime(current_year + 1, month, day)
+                origin = match.group(1).capitalize()
+                destination = match.group(2).capitalize()
                 
-            return date_with_year.strftime('%Y-%m-%d')
-            
-        # Try dateutil parser as a backup
-        try:
-            parsed_date = parser.parse(date_str, fuzzy=True)
-            # Handle missing year by adding current year
-            if parsed_date.year == 1900:  # dateutil's default when year is missing
-                if parsed_date.replace(year=current_year) < today:
-                    parsed_date = parsed_date.replace(year=current_year + 1)
-                else:
-                    parsed_date = parsed_date.replace(year=current_year)
-            return parsed_date.strftime('%Y-%m-%d')
-        except:
-            pass
-            
-        return ""
-    except Exception as e:
-        print(f"Error parsing date '{date_str}': {e}")
-        return ""
+            departure_date = match.group(3)
 
-def extract_travel_info(question: str):
-    """
-    Extract origin, destination and date from natural language query
-    """
-    origin = None
-    destination = None
-    date_str = None
-    
-    # Clean up the query - replace specific words that might confuse the parsing
-    cleaned_question = question.lower()
-    cleaned_question = re.sub(r'\bheading\b', 'to', cleaned_question)
-    cleaned_question = re.sub(r'\btraveling\b', 'travel', cleaned_question)
-    
-    # Extract date first to avoid it being misidentified as a location
-    date_patterns = [
-        r'on\s+([a-zA-Z0-9\s,\.\/\-]+(?:of\s+[a-zA-Z]+)?(?:\s+\d{4})?)',
-        r'for\s+([a-zA-Z0-9\s,\.\/\-]+(?:of\s+[a-zA-Z]+)?(?:\s+\d{4})?)',
-        r'date[:]?\s+([a-zA-Z0-9\s,\.\/\-]+(?:of\s+[a-zA-Z]+)?(?:\s+\d{4})?)',
-        r'(\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?[a-zA-Z]+(?:\s+\d{4})?)',
-        r'([a-zA-Z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?)',
-    ]
-    
-    for pattern in date_patterns:
-        match = re.search(pattern, cleaned_question)
-        if match:
-            date_candidates = match.group(1).strip().rstrip('.,:;')
-            # Don't include question fragments in the date
-            if 'are there' not in date_candidates and 'is there' not in date_candidates:
-                date_str = date_candidates
-                # Remove the date part from the question to avoid confusion in city extraction
-                cleaned_question = cleaned_question.replace(match.group(0), ' ')
-                break
-    
-    # Common patterns for origin/destination
-    city_patterns = [
-        # from X to Y
-        r'from\s+([a-zA-Z\s]+?)\s+to\s+([a-zA-Z\s]+?)(?:\s+on|\s+for|\s+at|\s+in|\s+\?|$|\.)',
-        # departing X going to Y
-        r'(?:departing|leaving)\s+(?:from\s+)?([a-zA-Z\s]+?)\s+(?:to|going to|heading to|for)\s+([a-zA-Z\s]+?)(?:\s+on|\s+for|\s+at|\s+in|\s+\?|$|\.)',
-        # X to Y (where X is likely origin)
-        r'(?:^|\s)([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+to\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)(?:\s+on|\s+for|\s+at|\s+in|\s+\?|$|\.)',
-    ]
-    
-    for pattern in city_patterns:
-        match = re.search(pattern, cleaned_question)
-        if match:
-            origin = match.group(1).strip().rstrip('.,:;')
-            destination = match.group(2).strip().rstrip('.,:;')
-            break
-    
-    # If we still don't have cities, try looser individual city detection
-    if not origin or not destination:
-        from_pattern = r'(?:from|departing|departing from|leaving|leaving from)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)'
-        to_pattern = r'(?:to|going to|heading to|destination|arriving at|arrive at|arrival)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)'
-        
-        from_match = re.search(from_pattern, cleaned_question)
-        to_match = re.search(to_pattern, cleaned_question)
-        
-        if from_match:
-            origin = from_match.group(1).strip().rstrip('.,:;')
-        if to_match:
-            destination = to_match.group(1).strip().rstrip('.,:;')
-    
-    # Format the date if found
-    formatted_date = None
-    if date_str:
-        formatted_date = parse_human_readable_date(date_str)
-    
-    return {
-        "origin": origin,
-        "destination": destination,
-        "date": formatted_date,
-        "date_str": date_str
-    }
+            # Convert textual dates like 'June 15' to a standard format like '2025-06-15'
+            try:
+                if re.match(r'\d{4}-\d{2}-\d{2}', departure_date):  # If date is in YYYY-MM-DD format
+                    departure_date = datetime.strptime(departure_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+                else:  # If date is in Month Day format (e.g., June 15)
+                    # Use CURRENT year (not next year) for date
+                    current_year = datetime.now().year
+                    date_with_year = f"{departure_date} {current_year}"
+                    
+                    # Try different date formats
+                    for date_format in ["%B %d %Y", "%b %d %Y"]:
+                        try:
+                            parsed_date = datetime.strptime(date_with_year, date_format)
+                            departure_date = parsed_date.strftime("%Y-%m-%d")
+                            print(f"Successfully parsed date to: {departure_date}")
+                            break
+                        except ValueError:
+                            continue
+            except Exception as e:
+                print(f"Date parsing error: {e}")
+                return None, None, None  # Return None if date parsing fails
 
-def is_flight_query(question: str) -> bool:
-    keywords = ["flight", "book", "booking", "book a flight", "find flight", "cheap flights", "airfare", 
-                "travel", "trip", "tickets", "fly", "flying", "journey", "departure", "departing"]
-    return any(k in question.lower() for k in keywords)
+            return origin, destination, departure_date
 
-def is_partial_booking_info(info):
-    """Check if we have partial booking information"""
-    return any([info["origin"], info["destination"], info["date_str"]]) and not all([info["origin"], info["destination"], info["date"]])
+    # If no matches were found with any pattern
+    return None, None, None
 
-def ask_question(question: str):
-    data = load_data()
+# Function to get city code from city name using the cities API
+def get_city_code(city_name):
     try:
-        detected_language = detect(question)
-    except:
-        detected_language = "en"
-    lang_instruction = f"Respond ONLY in {detected_language}." if detected_language != "en" else "Respond in English."
-
-    # Debug info - print what was extracted
-    print(f"Processing question: {question}")
-    travel_info = extract_travel_info(question)
-    print(f"Extracted info: {travel_info}")
-
-    # Check if this is a flight query
-    if is_flight_query(question):
-        # Try to extract travel information        
-        # If we have complete information, proceed with the flight search
-        if travel_info["origin"] and travel_info["destination"] and travel_info["date"]:
-            return {"question": question, "answer": get_flight_info(travel_info["origin"], travel_info["destination"], travel_info["date"])}
+        cities_api_url = f"https://tripzoori01-app.fly.dev/api/v1/base/cities/search?query={city_name}"
+        print(f"Calling cities API: {cities_api_url}")
+        cities_response = requests.get(cities_api_url)
         
-        # If we have partial information, ask for the missing details
-        elif is_partial_booking_info(travel_info):
-            missing_info_prompt = "I'd be happy to help you find flights. "
+        if cities_response.status_code == 200:
+            cities_data = cities_response.json()
+            print(f"Cities API response: {cities_data}")
+            if cities_data and len(cities_data) > 0:
+                # Return the airport code of the first matching city
+                return cities_data[0].get("code")
+    except Exception as e:
+        print(f"Error fetching city code: {e}")
+    
+    return None
+
+@app.get("/chat")
+async def chat_endpoint(message: str = ""):
+    if not message:
+        return JSONResponse(status_code=400, content={"error": "Missing 'message' query parameter"})
+
+    try:
+        print(f"Processing message: '{message}'")
+        
+        # Extract flight details first
+        origin, destination, departure_date = extract_flight_info(message)
+        
+        if origin and destination and departure_date:
+            print(f"Extracted: Origin={origin}, Destination={destination}, Date={departure_date}")
             
-            if not travel_info["origin"]:
-                missing_info_prompt += "Which city will you be departing from? "
+            # Get airport codes for the cities
+            origin_code = get_city_code(origin)
+            destination_code = get_city_code(destination)
             
-            if not travel_info["destination"]:
-                missing_info_prompt += "Where would you like to go to? "
+            # If we couldn't find the codes, use the city names as a fallback
+            if not origin_code:
+                print(f"Could not find code for {origin}, using name")
+                origin_code = origin
+            if not destination_code:
+                print(f"Could not find code for {destination}, using name")
+                destination_code = destination
+                
+            print(f"Using codes: Origin={origin_code}, Destination={destination_code}")
             
-            if not travel_info["date"]:
-                if travel_info["date_str"]:
-                    missing_info_prompt += f"I couldn't understand the date '{travel_info['date_str']}'. Could you please provide the date in a format like 'May 22, 2025' or 'next Friday'? "
+            # Make API call to get flight info using the user's actual inputs
+            flight_api_url = f"https://tripzoori01-app.fly.dev/api/v1/flights/search?origin={origin_code}&destination={destination_code}&departure_date={departure_date}"
+            print(f"Flight API URL: {flight_api_url}")
+            
+            flight_response = requests.get(flight_api_url)
+            print(f"Flight API status code: {flight_response.status_code}")
+            
+            if flight_response.status_code == 200:
+                flight_data = flight_response.json()
+                
+                # Extract itineraries from the flight data
+                flight_info = flight_data.get("itineraries", [])
+                print(f"Found {len(flight_info)} flight itineraries")
+                
+                if flight_info:
+                    # Format a nice response with the flight details
+                    flight_summary = flight_info[0]  # Get the first flight option
+                    
+                    # Extract key details for a clean response
+                    segments = flight_summary.get("segments", [])
+                    
+                    if segments:
+                        # Format departure and arrival details
+                        first_segment = segments[0]
+                        last_segment = segments[-1]
+                        
+                        # Format times for display
+                        dep_time = datetime.fromisoformat(first_segment["departureTime"].replace('Z', '+00:00'))
+                        arr_time = datetime.fromisoformat(last_segment["arrivalTime"].replace('Z', '+00:00'))
+                        formatted_dep_time = dep_time.strftime("%B %d, %Y at %H:%M")
+                        formatted_arr_time = arr_time.strftime("%B %d, %Y at %H:%M")
+                        
+                        # Calculate total duration across all segments
+                        total_duration_minutes = sum(segment.get("duration", 0) for segment in segments)
+                        hours = total_duration_minutes // 60
+                        minutes = total_duration_minutes % 60
+                        
+                        # Get price
+                        price_info = flight_summary.get("price", {})
+                        total_fare = price_info.get("totalFare", "N/A")
+                        currency = price_info.get("currency", "USD")
+                        
+                        # Create a clean response
+                        formatted_response = (
+                            f"Flight found from {origin} to {destination}!\n\n"
+                            f"Departure: {first_segment.get('departureCity')} ({first_segment.get('departureAirportCode')}) on {formatted_dep_time}\n"
+                            f"Arrival: {last_segment.get('arrivalCity')} ({last_segment.get('arrivalAirportCode')}) on {formatted_arr_time}\n"
+                            f"Duration: {hours}h {minutes}m\n"
+                            f"Stops: {len(segments) - 1}\n"
+                            f"Price: {currency} {total_fare}\n"
+                            f"Airline: {first_segment.get('airlineName')}"
+                        )
+                        
+                        return {"response": formatted_response}
+                    else:
+                        return {"response": f"Flight found from {origin} to {destination}, but no segment details available."}
                 else:
-                    missing_info_prompt += "When would you like to travel? "
-            
-            # Include the information we already have for confirmation
-            if travel_info["origin"] or travel_info["destination"] or travel_info["date"]:
-                missing_info_prompt += "\n\nHere's what I understood so far: "
-                if travel_info["origin"]:
-                    missing_info_prompt += f"\n- Departing from: {travel_info['origin']}"
-                if travel_info["destination"]:
-                    missing_info_prompt += f"\n- Going to: {travel_info['destination']}"
-                if travel_info["date"]:
-                    missing_info_prompt += f"\n- Date: {travel_info['date']}"
-            
-            return {"response": missing_info_prompt}
-        
-        # Generic booking intent detected but no specific details
-        else:
+                    # No flights found with the user's parameters
+                    return {"response": f"No flights found from {origin} ({origin_code}) to {destination} ({destination_code}) on {departure_date}."}
+            else:
+                error_message = flight_response.text if hasattr(flight_response, 'text') else "Unknown error"
+                return {"response": f"Sorry, I couldn't find flight information. The flight search API returned status: {flight_response.status_code}. Error: {error_message}"}
+
+        # If flight details aren't found, process general travel intent
+        if is_general_travel_request(message):
             return {
-                "response": "I'd be happy to help you find flights! Could you please provide the following details?\n\n1. Where will you be departing from?\n2. Where would you like to go?\n3. When do you plan to travel? (You can say things like 'May 22nd', 'next Friday', or '06/15/2025')"
+                "response": (
+                    "Great! Let's plan your trip. I need a few details first:\n"
+                    "1. Where do you want to go?\n"
+                    "2. Where are you departing from?\n"
+                    "3. What date do you want to travel?\n"
+                    "You can answer all at once, like: 'I want to go to Paris from Nairobi on June 15'."
+                )
             }
 
-    # Handle conversation state - if they're responding to our questions about booking
-    state_keywords = {
-        "departure": ["from", "leaving", "departing", "departure city", "starting from"],
-        "destination": ["to", "going to", "destination", "arriving at", "want to visit"],
-        "date": ["on", "date", "when", "departing on", "leaving on", "travel on"]
-    }
-    
-    for state, keywords in state_keywords.items():
-        if any(k in question.lower() for k in keywords) and len(question.split()) < 5:
-            # This looks like an answer to our previous question
-            if state == "departure":
-                return {"response": f"Great! You're departing from {question.strip()}. Where would you like to go?"}
-            elif state == "destination":
-                return {"response": f"Perfect! When would you like to travel to {question.strip()}? (You can say dates like 'next Friday', '22nd May', etc.)"}
-            elif state == "date":
-                date = parse_human_readable_date(question)
-                if date:
-                    return {"response": f"Thanks! I've noted your travel date as {date}. To complete your flight search, could you please tell me your departure city and destination?"}
-                else:
-                    return {"response": "I'm having trouble understanding that date format. Could you please provide it in a format like 'May 22, 2025' or 'next Friday'?"}
-    
-    prompt = f"""
-You are a helpful AI assistant that answers questions based ONLY on the content of the website below.
+        # Otherwise proceed to generate full response
+        prompt = (
+            f"You are a smart travel assistant. A user says: '{message}'.\n"
+            f"Reply in a concise format only including:\n"
+            f"- Destination\n- Trip type\n- Duration\n- 4–5 key highlights\n"
+            f"Do not include full-day itineraries or example prompts."
+        )
+        response = model.generate_content(prompt)
+        concise_response = format_short(response.text)
+        return {"response": concise_response}
 
-{lang_instruction}
-
-Website Content:
-{data}
-
-User's Question: {question}
-
-Answer:
-"""
-    model = genai.GenerativeModel("gemini-1.5-pro")
-    response = model.generate_content(prompt)
-    answer = response.text.strip()
-
-    if needs_human_agent(question, answer):
-        send_message_to_tidio(f"User asked: '{question}'\nBot could not answer.")
-        return {
-            "message": "I am unable to answer this question right now, but don't worry, we are connecting you to a live agent.",
-            "status": "transferred_to_human"
-        }
-
-    return {"question": question, "answer": answer}
-
-@app.get("/ask")
-async def get_answer(question: str = Query(..., title="Question", description="Ask a question about the website or flights")):
-    if any(keyword in question.lower() for keyword in ["transfer to human agent", "talk to a person", "speak to support"]):
-        message_sent = send_message_to_tidio(f"User requested a human agent for: '{question}'")
-        return {
-            "message": "Please hold on, we're connecting you to a live agent.",
-            "status": "transferred_to_human" if message_sent else "error"
-        }
-
-    with ThreadPoolExecutor() as executor:
-        result = executor.submit(ask_question, question).result()
-    return result
+    except Exception as e:
+        print(f"Exception: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
